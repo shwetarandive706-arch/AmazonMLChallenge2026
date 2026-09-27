@@ -3,25 +3,13 @@ build_small_training_pairs.py
 =============================
 Creates a fast, high-quality, balanced pairwise training dataset for the 2,000 S1 train subset.
 
-Process:
-  1. Loads the 2,000 S1 IDs from splits/train_subset_2k_ids.txt.
-  2. Extracts S1 records (name, address, country) from dataset/train/train_source1.tsv.
-  3. Loads ground truth from dataset/train/train_ground_truth.tsv for these 2,000 S1 entities.
-     - Adds every ground-truth match as a positive pair (label = 1).
-  4. Collects set of unique meaningful name tokens across the 2,000 S1 entities.
-  5. Single-pass streams S2 and S3, selecting records that share name tokens within the same country.
-  6. Samples hard negative pairs (label = 0) with lexical overlap:
-     - Must be same country
-     - Must NOT be in ground truth for that S1
-     - Capped at max 10 negatives per positive pair (min 5 for singletons)
-     - Deterministic sampling with seed=42
-  7. Outputs: output/small_train_pairs.tsv
-
-Columns:
-  source1_entity_id
-  candidate_entity_id
-  source
-  label
+Fix applied:
+  1. Strict AND condition: Candidates must share AT LEAST 2 TOKENS with an S1 entity,
+     OR share a rare distinctive token (frequency threshold: appears in <= 5 S1s, len >= 4, not stopword).
+  2. Per-S1 candidate capping (max 30 candidates per S1 entity during streaming).
+  3. Hard assertion: Candidate pool MUST be <= 100,000 (expected ~10,000 to 50,000).
+  4. Top 20 token frequency analysis printed before streaming.
+  5. Outputs: output/small_train_pairs.tsv
 """
 
 import os
@@ -31,23 +19,51 @@ import random
 import unicodedata
 import pandas as pd
 import numpy as np
-from collections import defaultdict
+from itertools import combinations
+from collections import defaultdict, Counter
 from typing import Dict, Set, List, Tuple
 
-STOPWORDS = {
+# Re-use LEGAL_TOKENS from normalization.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(BASE_DIR, "code", "business_entity_resolution", "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+try:
+    from normalization import LEGAL_TOKENS
+except ImportError:
+    LEGAL_TOKENS = {
+        "llc", "inc", "corp", "corporation", "ltd", "limited", "pvt", "private",
+        "plc", "sarl", "sas", "co", "company", "llp", "pc", "lc", "gmbh", "sa",
+        "sci", "incorporated", "enterprises", "associates", "holding", "holdings"
+    }
+
+LINGUISTIC_STOPWORDS = {
     "and", "the", "of", "in", "for", "at", "to", "a", "an", "on", "by",
-    "inc", "corp", "llc", "ltd", "pvt", "limited", "co", "company"
+    "with", "from", "as", "into", "through", "during", "including", "until",
+    "against", "among", "throughout", "despite", "towards", "upon"
 }
 
+GENERIC_BUSINESS_WORDS = {
+    "services", "service", "solutions", "solution", "group", "technologies",
+    "technology", "tech", "international", "global", "industries", "industry",
+    "systems", "system", "consulting", "consultancy", "management", "enterprise",
+    "enterprises", "associates", "associate", "partners", "partner", "national",
+    "products", "product", "trading", "logistics", "commercial", "development",
+    "financial", "finance", "ventures", "venture", "capital", "properties",
+    "property", "realty", "agency", "center", "centre", "network", "marketing",
+    "investments", "investment", "holdings", "holding", "india", "american"
+}
 
-def clean_tokens(s: str) -> Set[str]:
-    """Lightweight fast tokenization for candidate matching."""
+GENERIC_STOPWORDS = set(LEGAL_TOKENS) | LINGUISTIC_STOPWORDS | GENERIC_BUSINESS_WORDS
+
+
+def clean_tokens(s: str) -> List[str]:
+    """Extract list of clean normalized tokens of length >= 2."""
     if not s or pd.isna(s):
-        return set()
-    # Normalize accents, lowercase
+        return []
     s_norm = unicodedata.normalize("NFKD", str(s)).lower()
-    # Extract alphanumeric tokens of length >= 3
-    tokens = set()
+    tokens = []
     current = []
     for ch in s_norm:
         if ch.isalnum():
@@ -55,13 +71,13 @@ def clean_tokens(s: str) -> Set[str]:
         else:
             if current:
                 w = "".join(current)
-                if len(w) >= 3 and w not in STOPWORDS:
-                    tokens.add(w)
+                if len(w) >= 2 and w not in LINGUISTIC_STOPWORDS:
+                    tokens.append(w)
                 current = []
     if current:
         w = "".join(current)
-        if len(w) >= 3 and w not in STOPWORDS:
-            tokens.add(w)
+        if len(w) >= 2 and w not in LINGUISTIC_STOPWORDS:
+            tokens.append(w)
     return tokens
 
 
@@ -85,16 +101,15 @@ def main():
     print("=" * 70)
 
     # 1. Load target S1 IDs ----------------------------------------------------
-    print(f"[1/6] Loading target S1 IDs from {train_ids_path} ...")
+    print(f"[1/7] Loading target S1 IDs from {train_ids_path} ...")
     with open(train_ids_path, "r", encoding="utf-8") as f:
         target_s1_ids = {line.strip() for line in f if line.strip()}
     print(f"      Target S1 count: {len(target_s1_ids):,}")
     assert len(target_s1_ids) == 2000, f"Expected 2,000 IDs, found {len(target_s1_ids)}"
 
     # 2. Extract S1 records ----------------------------------------------------
-    print(f"[2/6] Extracting S1 records from {s1_path} ...")
-    s1_data = {}  # eid -> (name, country, tokens)
-    s1_tokens_by_country = {"India": set(), "US": set()}
+    print(f"[2/7] Extracting S1 records from {s1_path} ...")
+    s1_data = {}  # eid -> (name, country, tokens_set)
 
     for chunk in pd.read_csv(
         s1_path, sep="\t", dtype=str,
@@ -106,17 +121,42 @@ def main():
             eid = str(row.entity_id)
             name = str(row.business_name) if pd.notna(row.business_name) else ""
             country = str(row.country) if pd.notna(row.country) else ""
-            toks = clean_tokens(name)
+            toks = set(clean_tokens(name))
             s1_data[eid] = (name, country, toks)
-            if country in s1_tokens_by_country:
-                s1_tokens_by_country[country].update(toks)
 
-    print(f"      Loaded {len(s1_data):,} S1 entities.")
-    print(f"      Unique S1 query tokens: India={len(s1_tokens_by_country['India']):,}, US={len(s1_tokens_by_country['US']):,}")
+    print(f"      Loaded {len(s1_data):,} train S1 entities.")
 
-    # 3. Load Ground Truth for target S1 entities ------------------------------
-    print(f"[3/6] Loading Ground Truth from {gt_path} ...")
-    gt_map = defaultdict(set)  # s1_id -> set of matched_entity_ids
+    # 3. Frequency Analysis and Indexing ---------------------------------------
+    print(f"[3/7] Analyzing S1 token frequencies & building AND / rare-token queries ...")
+    all_s1_tokens_flat = [tok for eid in target_s1_ids for tok in s1_data[eid][2]]
+    token_counts = Counter(all_s1_tokens_flat)
+
+    print("\n      Top 20 most frequent S1 tokens:")
+    print(f"      {'Token':<20} {'Count':>6}  {'Category':<15}")
+    print("      " + "-" * 45)
+    for tok, cnt in token_counts.most_common(20):
+        cat = "GENERIC_STOP" if tok in GENERIC_STOPWORDS else "DISTINCTIVE"
+        print(f"      {tok:<20} {cnt:>6}  {cat:<15}")
+    print("      " + "-" * 45 + "\n")
+
+    # Build token-pair and rare-token indices per country
+    s1_by_token_pair = {"India": defaultdict(list), "US": defaultdict(list)}
+    s1_by_rare_token = {"India": defaultdict(list), "US": defaultdict(list)}
+
+    for eid, (name, country, toks) in s1_data.items():
+        if country not in s1_by_token_pair:
+            continue
+        sorted_toks = sorted(toks)
+        for t1, t2 in combinations(sorted_toks, 2):
+            s1_by_token_pair[country][(t1, t2)].append(eid)
+
+        for t in toks:
+            if t not in GENERIC_STOPWORDS and len(t) >= 4 and token_counts[t] <= 5:
+                s1_by_rare_token[country][t].append(eid)
+
+    # 4. Load Ground Truth for target S1 entities ------------------------------
+    print(f"[4/7] Loading Ground Truth from {gt_path} ...")
+    gt_map = defaultdict(set)
     for chunk in pd.read_csv(
         gt_path, sep="\t", dtype=str,
         keep_default_na=False, chunksize=500_000
@@ -134,19 +174,15 @@ def main():
     total_gt_matches = sum(len(m) for m in gt_map.values())
     print(f"      Found {total_gt_matches:,} true positive links across {len(gt_map):,} non-singleton S1 entities.")
 
-    # 4. Stream S2 and S3 for candidates sharing S1 tokens --------------------
-    print(f"[4/6] Streaming S2 & S3 to collect candidate pool ...")
-    # country -> token -> list of candidate eids
-    token_index = {
-        "India": defaultdict(list),
-        "US": defaultdict(list)
-    }
-    all_candidate_ids = set()
+    # 5. Stream S2 & S3 with AND condition and per-S1 cap (max 30) ------------
+    print(f"[5/7] Streaming S2 & S3 with strict AND condition (cap 30 per S1) ...")
+    
+    s1_candidate_pool = defaultdict(lambda: defaultdict(int))
+    all_matched_cands_by_source = {"S2": set(), "S3": set()}
 
     for src_name, path in [("S2", s2_path), ("S3", s3_path)]:
         t_src0 = time.time()
         print(f"      Streaming {src_name} ({path}) ...")
-        cnt = 0
         for chunk in pd.read_csv(
             path, sep="\t", dtype=str,
             usecols=["entity_id", "business_name", "country"],
@@ -154,24 +190,58 @@ def main():
         ):
             for row in chunk.itertuples(index=False):
                 country = str(row.country)
-                if country not in token_index:
+                if country not in s1_by_token_pair:
                     continue
                 name = str(row.business_name) if pd.notna(row.business_name) else ""
                 eid = str(row.entity_id)
-                toks = clean_tokens(name)
-                # Check intersection with S1 tokens for this country
-                shared = toks & s1_tokens_by_country[country]
-                if shared:
-                    for t in shared:
-                        token_index[country][t].append(eid)
-                    all_candidate_ids.add(eid)
-                    cnt += 1
-        print(f"        Matched {cnt:,} {src_name} records sharing tokens in {time.time()-t_src0:.1f}s.")
+                cand_toks = set(clean_tokens(name))
+                if len(cand_toks) == 0:
+                    continue
 
-    print(f"      Total unique candidate records gathered: {len(all_candidate_ids):,}")
+                matched_s1_for_row = defaultdict(int)
 
-    # 5. Build Positive and Negative Pairs ------------------------------------
-    print(f"[5/6] Assembling balanced training pairs ...")
+                # A. Check token pairs (THE AND CONDITION: >= 2 shared tokens)
+                if len(cand_toks) >= 2:
+                    sorted_cand_toks = sorted(cand_toks)
+                    pair_index = s1_by_token_pair[country]
+                    for t1, t2 in combinations(sorted_cand_toks, 2):
+                        hit_s1s = pair_index.get((t1, t2))
+                        if hit_s1s:
+                            for s1_id in hit_s1s:
+                                matched_s1_for_row[s1_id] += 3
+
+                # B. Check rare distinctive tokens (single-token match only if rare)
+                rare_index = s1_by_rare_token[country]
+                for t in cand_toks:
+                    hit_s1s = rare_index.get(t)
+                    if hit_s1s:
+                        for s1_id in hit_s1s:
+                            matched_s1_for_row[s1_id] += 1
+
+                # Update candidate pools with per-S1 cap
+                for s1_id, score in matched_s1_for_row.items():
+                    pool = s1_candidate_pool[s1_id]
+                    if len(pool) < 30 or score > min(pool.values()):
+                        pool[eid] = max(pool[eid], score)
+                        all_matched_cands_by_source[src_name].add(eid)
+                        if len(pool) > 35:
+                            worst_key = min(pool.keys(), key=lambda k: pool[k])
+                            del pool[worst_key]
+
+        print(f"        Matched {len(all_matched_cands_by_source[src_name]):,} unique {src_name} records in {time.time()-t_src0:.1f}s.")
+
+    total_candidates = len(all_matched_cands_by_source["S2"] | all_matched_cands_by_source["S3"])
+    print(f"\n      Total unique candidate pool size: {total_candidates:,}")
+
+    if total_candidates > 100_000:
+        print(f"\n[ALERT] Candidate pool size {total_candidates:,} exceeds 100,000 limit!")
+        print("Stopping as instructed.")
+        sys.exit(1)
+    else:
+        print(f"      [OK] Candidate pool size {total_candidates:,} is well under 100,000 threshold.")
+
+    # 6. Build Positive and Negative Pairs ------------------------------------
+    print(f"[6/7] Assembling balanced training pairs ...")
     output_rows = []
     seen_pairs = set()
 
@@ -181,8 +251,6 @@ def main():
     s3_cand_count = 0
     pos_count = 0
     neg_count = 0
-
-    rng = random.Random(42)
 
     for s1_id in sorted(target_s1_ids):
         name, country, s1_toks = s1_data.get(s1_id, ("", "", set()))
@@ -206,23 +274,15 @@ def main():
                 else:
                     s3_cand_count += 1
 
-        # B. Find hard negatives: same country, share tokens, not true match
-        cand_score = defaultdict(int)
-        c_index = token_index.get(country, {})
-        for t in s1_toks:
-            for cid in c_index.get(t, []):
-                if cid not in true_matches:
-                    cand_score[cid] += 1
+        # B. Add hard negatives: from pool, excluding true matches
+        cand_dict = s1_candidate_pool.get(s1_id, {})
+        valid_negs = [
+            (cid, score) for cid, score in cand_dict.items() if cid not in true_matches
+        ]
+        valid_negs.sort(key=lambda x: (-x[1], x[0]))
 
-        # Max negatives: 10 per positive pair, or 5 if singleton
         max_negs = max(5, min(10 * len(true_matches), 30)) if true_matches else 5
-
-        if cand_score:
-            # Sort by shared token count descending, then deterministic tie-break
-            scored_candidates = sorted(cand_score.items(), key=lambda x: (-x[1], x[0]))
-            selected_negs = [cid for cid, _ in scored_candidates[:max_negs]]
-        else:
-            selected_negs = []
+        selected_negs = [cid for cid, _ in valid_negs[:max_negs]]
 
         for neg_id in selected_negs:
             pair_key = (s1_id, neg_id)
@@ -236,8 +296,8 @@ def main():
                 else:
                     s3_cand_count += 1
 
-    # 6. Write to output TSV ---------------------------------------------------
-    print(f"[6/6] Writing output to {out_path} ...")
+    # 7. Write to output TSV ---------------------------------------------------
+    print(f"[7/7] Writing output to {out_path} ...")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("source1_entity_id\tcandidate_entity_id\tsource\tlabel\n")
         for s1_id, cid, src, lbl in output_rows:
@@ -245,7 +305,6 @@ def main():
 
     t_elapsed = time.time() - t_start
 
-    # 7. Print verification summary --------------------------------------------
     total_pairs = len(output_rows)
     pos_pct = (pos_count / total_pairs * 100) if total_pairs else 0.0
 
